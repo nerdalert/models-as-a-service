@@ -360,6 +360,54 @@ metadata:
 EOF
 }
 
+ensure_kuadrant_operator_rbac() {
+  echo
+  echo "* Ensuring Kuadrant operator RBAC..."
+
+  if ! command -v oc &>/dev/null; then
+    echo "  WARNING: 'oc' CLI not found; skipping operator RBAC fixes."
+    return 0
+  fi
+
+  local sas=(
+    authorino-operator
+    kuadrant-operator-controller-manager
+    limitador-operator-controller-manager
+    dns-operator-controller-manager
+  )
+
+  local needs_rbac=false
+  for deploy in "${sas[@]}"; do
+    if oc get deployment "$deploy" -n kuadrant-system &>/dev/null; then
+      if oc logs -n kuadrant-system deployment/"$deploy" --tail=50 2>/dev/null | grep -q "forbidden: User"; then
+        needs_rbac=true
+        break
+      fi
+    fi
+  done
+
+  if [[ "$needs_rbac" != true ]]; then
+    echo "  Kuadrant operators appear healthy; skipping RBAC changes."
+    return 0
+  fi
+
+  echo "  Detected RBAC errors; applying cluster-admin to Kuadrant operator service accounts."
+  for sa in "${sas[@]}"; do
+    oc adm policy add-cluster-role-to-user cluster-admin -z "$sa" -n kuadrant-system >/dev/null 2>&1 || true
+  done
+
+  # Restart operators to pick up RBAC changes.
+  oc rollout restart deployment/authorino-operator -n kuadrant-system >/dev/null 2>&1 || true
+  oc rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >/dev/null 2>&1 || true
+  oc rollout restart deployment/limitador-operator-controller-manager -n kuadrant-system >/dev/null 2>&1 || true
+  oc rollout restart deployment/dns-operator-controller-manager -n kuadrant-system >/dev/null 2>&1 || true
+
+  oc rollout status deployment/authorino-operator -n kuadrant-system --timeout=3m >/dev/null 2>&1 || true
+  oc rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=3m >/dev/null 2>&1 || true
+  oc rollout status deployment/limitador-operator-controller-manager -n kuadrant-system --timeout=3m >/dev/null 2>&1 || true
+  oc rollout status deployment/dns-operator-controller-manager -n kuadrant-system --timeout=3m >/dev/null 2>&1 || true
+}
+
 deploy_rhoai() {
   # Check if ODH is already installed - can't have both
   local odh_csv_count=$(checkcsvexists "opendatahub-operator")
@@ -572,6 +620,7 @@ echo "## Installing prerequisites"
 deploy_certmanager
 deploy_lws
 deploy_rhcl
+ensure_kuadrant_operator_rbac
 
 echo
 echo "## Installing $(echo "$OPERATOR_TYPE" | tr '[:lower:]' '[:upper:]') operator"
