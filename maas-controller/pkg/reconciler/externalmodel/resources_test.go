@@ -79,8 +79,9 @@ func TestBuildHTTPRoute(t *testing.T) {
 	assert.Equal(t, "/llm/gpt-4o", *rule1.Matches[0].Path.Value)
 	assert.Equal(t, "gpt-4o", string(rule1.BackendRefs[0].Name))
 
-	// Rule 2: header-based match
+	// Rule 2: header + path match (path required for Kuadrant auth enforcement)
 	rule2 := hr.Spec.Rules[1]
+	assert.Equal(t, "/llm/gpt-4o", *rule2.Matches[0].Path.Value, "Rule 2 must include path for auth enforcement")
 	assert.Equal(t, "X-Gateway-Model-Name", string(rule2.Matches[0].Headers[0].Name))
 	assert.Equal(t, "gpt-4o", rule2.Matches[0].Headers[0].Value)
 

@@ -152,10 +152,16 @@ func buildHTTPRoute(endpoint, name, namespace string, port int32, gatewayName, g
 					Filters:     filters,
 					Timeouts:    &gatewayapiv1.HTTPRouteTimeouts{Request: &timeout},
 				},
-				// Rule 2: Header-based match — BBR ClearRouteCache sets this header
+				// Rule 2: Header + path match — BBR ClearRouteCache sets this header
+				// after extracting the model name from the request body. Path prefix
+				// is required so Kuadrant's WasmPlugin enforces auth on this rule too.
 				{
 					Matches: []gatewayapiv1.HTTPRouteMatch{
 						{
+							Path: &gatewayapiv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &pathPrefix,
+							},
 							Headers: []gatewayapiv1.HTTPHeaderMatch{
 								{
 									Name:  "X-Gateway-Model-Name",
