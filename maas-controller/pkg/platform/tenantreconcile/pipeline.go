@@ -276,7 +276,12 @@ func reconcilePayloadProcessingSwitch(
 			}
 			affectedModels, err := legacyIPPTranslationModels(ctx, apiReader, *params, tenant)
 			if err != nil {
-				return payloadProcessingSwitchOutcome{}, fmt.Errorf("assess legacy IPP translation compatibility before cleanup: %w", err)
+				blockedReason := fmt.Sprintf("cannot assess legacy IPP translation compatibility (%v); keeping the IPP ConfigMap and resources", err)
+				if err := setPayloadProcessingMigrationAnnotation(ctx, c, tenant, PayloadProcessingMigrationBlocked); err != nil {
+					return payloadProcessingSwitchOutcome{}, fmt.Errorf("mark API translation compatibility migration blocked: %w", err)
+				}
+				params.Warnings = append(params.Warnings, blockedReason)
+				return payloadProcessingSwitchOutcome{blockedReason: blockedReason}, nil
 			}
 			if len(affectedModels) > 0 {
 				compatibilityRisk := apiTranslationCompatibilityRisk(affectedModels)

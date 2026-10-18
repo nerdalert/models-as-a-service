@@ -9,13 +9,113 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metamapping "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 )
+
+type failingExternalModelReader struct {
+	client.Reader
+	err error
+}
+
+func (r failingExternalModelReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if models, ok := list.(*unstructured.UnstructuredList); ok && models.GetKind() == "ExternalModelList" {
+		return r.err
+	}
+	return r.Reader.List(ctx, list, opts...)
+}
+
+type failingMigrationAnnotationClient struct{ client.Client }
+
+func (c failingMigrationAnnotationClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*maasv1alpha1.MaasTenantConfig); ok {
+		return errors.New("migration annotation write denied")
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestRunPlatformBlocksMigrationWhenExternalModelAssessmentFails(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "list failure", err: errors.New("ExternalModel list unavailable")},
+		{name: "unknown discovery", err: &metamapping.NoKindMatchError{
+			GroupKind:        schema.GroupKind{Group: "inference.opendatahub.io", Kind: "ExternalModel"},
+			SearchedVersions: []string{"v1alpha1"},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const (
+				tenantName = "translation-team"
+				appNS      = "ai-tenant-translation-team"
+				gatewayNS  = "openshift-ingress"
+				gateway    = "translation-gateway"
+			)
+			scheme := praxisTestScheme(t)
+			tenant := praxisTenantConfig(appNS, tenantName)
+			config := &maasv1alpha1.Config{ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("config-uid")}}
+			plugins := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name: PayloadProcessingPluginsConfigMapForTenant(tenantName), Namespace: gatewayNS,
+			}, Data: map[string]string{ippPreProcessingConfigKey: defaultPreProcessingYAML, ippProcessingConfigKey: defaultProcessingYAML}}
+			deployment := unstructuredIPPObject(GVKDeployment, gatewayNS, PayloadProcessingDeploymentName(tenantName), nil)
+			setConfigControllerOwnerRef(deployment, config.UID)
+			base := newSSAFakeClientBuilder(scheme).WithObjects(
+				config, &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: gateway, Namespace: gatewayNS}},
+				tenant, readyMaaSAPIDeployment(appNS, tenantName), plugins, deployment,
+			).Build()
+			reader := failingExternalModelReader{Reader: base, err: test.err}
+			platformContext := PlatformContext{GatewayRef: maasv1alpha1.TenantGatewayRef{Namespace: gatewayNS, Name: gateway}, SkipIPP: true, Source: "aitenant"}
+			result, err := RunPlatformWithReader(context.Background(), logr.Discard(), base, reader, scheme, tenant,
+				platformContext, platformOverlayManifestPath(t), appNS, "controller-ns", "https://kubernetes.default.svc", "opendatahub", config)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.True(t, result.DeploymentPending, "uncertain provider state must block migration")
+			require.Contains(t, result.Detail, "cannot assess legacy IPP translation compatibility")
+			require.Contains(t, result.Detail, test.err.Error())
+			require.Contains(t, result.Detail, "keeping the IPP ConfigMap and resources")
+			require.Contains(t, result.Warnings, result.Detail)
+
+			stored := &maasv1alpha1.MaasTenantConfig{}
+			require.NoError(t, base.Get(context.Background(), client.ObjectKeyFromObject(tenant), stored))
+			require.Equal(t, PayloadProcessingMigrationBlocked, stored.Annotations[AnnotationPayloadProcessingMigration])
+			require.Empty(t, stored.Annotations[AnnotationPayloadProcessingStatus])
+			require.NoError(t, base.Get(context.Background(), client.ObjectKeyFromObject(plugins), &corev1.ConfigMap{}))
+			remaining := unstructuredIPPObject(GVKDeployment, gatewayNS, deployment.GetName(), nil)
+			require.NoError(t, base.Get(context.Background(), client.ObjectKeyFromObject(deployment), remaining))
+			require.NoError(t, base.Get(context.Background(), client.ObjectKey{Namespace: appNS, Name: MaaSAPIServiceName(tenantName)}, &corev1.Service{}),
+				"non-IPP resources must still be applied")
+		})
+	}
+}
+
+func TestMigrationAssessmentBlockReportsAnnotationWriteFailure(t *testing.T) {
+	const (
+		tenantName = "translation-team"
+		appNS      = "ai-tenant-translation-team"
+		gatewayNS  = "openshift-ingress"
+	)
+	tenant := praxisTenantConfig(appNS, tenantName)
+	plugins := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: PayloadProcessingPluginsConfigMapForTenant(tenantName), Namespace: gatewayNS,
+	}, Data: map[string]string{ippPreProcessingConfigKey: defaultPreProcessingYAML, ippProcessingConfigKey: defaultProcessingYAML}}
+	base := newSSAFakeClientBuilder(praxisTestScheme(t)).WithObjects(tenant, plugins).Build()
+	reader := failingExternalModelReader{Reader: base, err: errors.New("ExternalModel list unavailable")}
+	params := PlatformParams{SkipIPP: true, TenantIdentifier: tenantName, GatewayNamespace: gatewayNS, ModelNamespace: appNS}
+	_, err := reconcilePayloadProcessingSwitch(context.Background(), failingMigrationAnnotationClient{Client: base}, reader,
+		tenant, &params, nil, logr.Discard())
+	require.ErrorContains(t, err, "mark API translation compatibility migration blocked")
+	require.ErrorContains(t, err, "migration annotation write denied")
+	require.NoError(t, base.Get(context.Background(), client.ObjectKeyFromObject(plugins), &corev1.ConfigMap{}),
+		"annotation failure must not remove the IPP ConfigMap")
+}
 
 func TestRunPlatformPersistsResponseTranslationBeforeCleanupAndRetriesAfterFailure(t *testing.T) {
 	const (
